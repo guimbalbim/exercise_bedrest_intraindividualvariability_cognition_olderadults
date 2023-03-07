@@ -1,0 +1,2272 @@
+---
+title: "Data preparation and analysis of the manuscript: Exercise training mitigates the deleterious effects of experimental bed rest on intraindividual variability of executive functioning in older adults: A randomised controlled trial"
+author: "Guilherme Moraes Balbim"
+date: "03/06/2023"
+output: 
+  pdf_document: 
+    toc: yes
+    number_sections: yes
+    toc_depth: 5
+  word_document: 
+    toc: yes
+    toc_depth: 5
+geometry: "left = 1cm, right = 1cm, top = 1cm, bottom = 2.5cm"
+header-includes:
+- \usepackage{caption}
+- \usepackage{pdflscape}
+- \newcommand{\blandscape}{\begin{landscape}}
+- \newcommand{\elandscape}{\end{landscape}}
+editor_options: 
+  chunk_output_type: console
+---
+
+\newpage
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  fig.height = 7, fig.width = 9, fig.align = "center")
+```
+
+\small
+
+# Loading packages
+
+```{r, message=FALSE}
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, janitor, dplyr, openxlsx, stringr, ggplot2, data.table, knitr, tinytex, gghalves, ggdist, RColorBrewer,
+               mice, lme4, lmmfit, performance, rstatix, broom, emmeans, lmerTest, nlme, performance, patchwork, lsmeans, jtools,
+               sjPlot)
+
+```
+
+# Creating IIV metrics
+## Loading and cleaning data
+
+```{r, message = FALSE}
+
+all_data_nih_toolbox <- read.xlsx("../my_spreadsheets/CSA_NIHToolbox_raw_summarized_20230117.xlsx")
+
+all_data_nih_toolbox <- all_data_nih_toolbox %>% 
+  mutate(task = ifelse(str_detect(task, "flanker_con"), str_sub(task, end=11), task),
+         task = ifelse(str_detect(task, "flanker_incon"), str_sub(task, end=13), task),
+         task = ifelse(str_detect(task, "proc_speed"), str_sub(task, end=10), task),
+         task = ifelse(str_detect(task, "dccs_shape_repeat"), str_sub(task, end=17), task),
+         task = ifelse(str_detect(task, "dccs_color_switch"), str_sub(task, end=17), task)) %>% 
+  mutate(task = str_replace_all(task, c("dccs_shape_repeat" = "dccs_mixed",
+                                        "dccs_color_switch" = "dccs_mixed")))
+
+# Excluding incorrect responses
+
+all_data_nih_toolbox <- all_data_nih_toolbox %>% 
+  filter(score == 1)
+
+# Keeping only unique cases per task/timepoint (some duplicates included because of exported data)
+all_data_nih_toolbox <- all_data_nih_toolbox %>%
+  distinct(., .keep_all = TRUE) %>% 
+  select(id, itmordr, task, timepoint, responsetime) # Removes dates
+```
+
+### Flagging outliers as NAs
+```{r}
+# Remove RTs <150ms as well as 3 SD above the mean for each ID, timepoint and task
+all_data_nih_toolbox_out <- all_data_nih_toolbox %>% 
+  group_by(id, task, timepoint) %>%  
+  filter(responsetime > 0.150) %>% # only RTs above 150ms
+  mutate(responsetime = 
+           ifelse(responsetime > mean(responsetime, na.rm = TRUE) 
+                  + sd(responsetime, na.rm = TRUE)*3, NA, responsetime)) %>% 
+  ungroup()
+```
+
+## Imputation of missing data
+```{r, warning=FALSE}
+# Preparing data for imputation 
+all_data <- all_data_nih_toolbox_out %>%
+  group_by(id, timepoint, task) %>% 
+  mutate(trial = rank(itmordr)) %>% # this creates a new variable for order of trials in each task
+  select(-itmordr) %>% 
+  ungroup()
+
+
+# Function for imputation (one dataframe per participant)
+imputation <- function(subject, visit, measure){
+  
+  dataframe <- all_data %>% 
+    filter(id == subject) %>% 
+    filter(timepoint == visit) %>% 
+    filter(task == measure) 
+  
+  # Imputation with mice using regression method
+  imp <- mice(dataframe, m = 1, method = "norm.predict", 
+              seed = 1234, print = FALSE) 
+  
+  # Compile imputed dataset
+  imp <- complete(imp)
+  
+  # Retunrns imputed dataframe
+  return(imp)
+}
+
+# Object to store imputed data
+all_data_imp = as_tibble()
+
+# Loop to apply imputation
+for(visit in c("baseline_day1", "baseline_day5", "intervention_day7", "recovery_day1", "recovery_day7")){
+  
+  for(var in c("flanker_con","flanker_incon","dccs_mixed", "proc_speed")){
+    ids <- all_data %>% 
+      filter(task == var) %>% # task
+      filter(timepoint == visit) %>% # timepoint
+      group_by(id) %>% 
+      summarise(sumNA = sum(is.na(responsetime)), # total NA by id for task and timepoint
+                notNA = sum(!is.na(responsetime))) %>% # total not NA
+      filter(sumNA > 0) %>% 
+      filter(sumNA/notNA*100 < 50) %>% # Only participants wiht < 50% missing data are included in imputation
+      select(id) %>% 
+      ungroup() %>% 
+      unique()
+    
+    # Ids with missing data
+    ids <- ids$id
+    
+    # Loop to apply function
+    for(subj in ids){
+      
+      # Imputation with mice and norm.predic, 1 iteration
+      imputed <- imputation(subj, visit, var) # the three loops will replace each of these items
+      
+      # Compile imputed datasets
+      imputed <- complete(imputed)
+      
+      # Merge for all tasks and timepoints
+      all_data_imp <- rbind(all_data_imp, imputed) # this will stack the imputed datasets
+    }
+  }
+}
+
+# Adding imputed data to raw data and removing missing
+all_data_imp <- full_join(all_data, all_data_imp) %>% # Full join to merge imputed with raw data
+  filter(is.na(responsetime)==FALSE) # We then remove rows with NAs
+```
+
+## Merging NIH data with demographics
+```{r}
+# Merging NIH data with demographics to create models
+
+csa_demo <- read_csv("../my_spreadsheets/csa_demographics_20230117.csv", 
+                         show_col_types = FALSE,
+                         col_select = c(id, group, age, sex)) %>% 
+  glimpse()
+
+all_data_imp_final <- left_join(all_data_imp, csa_demo, by = "id") 
+
+all_data_imp_final <- all_data_imp_final %>% 
+  mutate(across(group, as_factor)) %>% 
+  mutate(across(sex, as_factor))
+
+```
+
+## Computing residualized ISD
+### Baseline (baseline_day1)
+```{r}
+# Pivoting data for regression
+all_data_imp_final <- all_data_imp_final %>% 
+  pivot_wider(names_from = task, values_from = responsetime)
+
+# Empty dataframe in for loop
+baseline_day1_clean = as_tibble()
+
+# For loop to run lm and extract residuals for each task residuals 
+for(var in c("flanker_con", "flanker_incon", "proc_speed", "dccs_mixed")){
+  
+  # Select only baseline data and remove NAs
+  baseline_day1 <- all_data_imp_final %>%
+    filter(timepoint == "baseline_day1") %>% 
+    select(id, timepoint, age, trial, .data[[var]]) %>%
+    drop_na()
+  
+  # Regression formula
+  form <- paste(var, " ~ age + trial + age*trial", sep = "")
+  
+  # Bias-free residuals
+  baseline_day1$residual <- resid(lm(form, baseline_day1))
+ 
+  # Transform to T score
+  baseline_day1 <- baseline_day1 %>% 
+    mutate(residual = scale(residual) * 10 + 50) %>% 
+    group_by(id) %>% 
+    summarise(r.isd = sd(residual, na.rm = TRUE),
+           n = n(),
+           task = var) %>% 
+    mutate(timepoint = "baseline_day1") %>% 
+    ungroup()
+  
+  # Merge all variables
+ baseline_day1_clean <- rbind(baseline_day1_clean, baseline_day1)
+}
+
+```
+
+### Baseline (baseline_day5)
+```{r}
+# Empty dataframe in for loop
+baseline_day5_clean = as_tibble()
+
+# For loop to run lm and extract residuals for each task residuals 
+for(var in c("flanker_con", "flanker_incon", "proc_speed", "dccs_mixed")){
+  
+  # Select only baseline_day5 data and remove NAs
+  baseline_day5 <- all_data_imp_final %>%
+    filter(timepoint == "baseline_day5") %>% 
+    select(id, timepoint, age, trial, .data[[var]]) %>%
+    drop_na()
+  
+  # Regression formula
+  form <- paste(var, " ~ age + trial + age*trial", sep = "")
+  
+  # Bias-free residuals
+  baseline_day5$residual <- resid(lm(form, baseline_day5))
+ 
+  # Transform to T score
+  baseline_day5 <- baseline_day5 %>% 
+    mutate(residual = scale(residual) * 10 + 50) %>% 
+    group_by(id) %>% 
+    summarise(r.isd = sd(residual, na.rm = TRUE),
+           n = n(),
+           task = var) %>% 
+    mutate(timepoint = "baseline_day5") %>% 
+    ungroup()
+  
+  # Merge all variables
+ baseline_day5_clean <- rbind(baseline_day5_clean, baseline_day5)
+}
+
+```
+
+### Intervention (intervention_day7)
+```{r}
+# Empty dataframe in for loop
+intervention_day7_clean = as_tibble()
+
+# For loop to run lm and extract residuals for each task residuals 
+for(var in c("flanker_con", "flanker_incon", "proc_speed", "dccs_mixed")){
+  
+  # Select only intervention_day7 data and remove NAs
+  intervention_day7 <- all_data_imp_final %>%
+    filter(timepoint == "intervention_day7") %>% 
+    select(id, timepoint, age, trial, .data[[var]]) %>%
+    drop_na()
+  
+  # Regression formula
+  form <- paste(var, " ~ age + trial + age*trial", sep = "")
+  
+  # Bias-free residuals
+  intervention_day7$residual <- resid(lm(form, intervention_day7))
+ 
+  # Transform to T score
+  intervention_day7 <- intervention_day7 %>% 
+    mutate(residual = scale(residual) * 10 + 50) %>% 
+    group_by(id) %>% 
+    summarise(r.isd = sd(residual, na.rm = TRUE),
+           n = n(),
+           task = var) %>% 
+    mutate(timepoint = "intervention_day7") %>% 
+    ungroup()
+  
+  # Merge all variables
+ intervention_day7_clean <- rbind(intervention_day7_clean, intervention_day7)
+}
+
+```
+
+### Recovery (recovery_day1)
+```{r}
+# Empty dataframe in for loop
+recovery_day1_clean = as_tibble()
+
+# For loop to run lm and extract residuals for each task residuals 
+for(var in c("flanker_con", "flanker_incon", "proc_speed", "dccs_mixed")){
+  
+  # Select only recovery_day1 data and remove NAs
+  recovery_day1 <- all_data_imp_final %>%
+    filter(timepoint == "recovery_day1") %>% 
+    select(id, timepoint, age, trial, .data[[var]]) %>%
+    drop_na()
+  
+  # Regression formula
+  form <- paste(var, " ~ age + trial + age*trial", sep = "")
+  
+  # Bias-free residuals
+  recovery_day1$residual <- resid(lm(form, recovery_day1))
+ 
+  # Transform to T score
+  recovery_day1 <- recovery_day1 %>% 
+    mutate(residual = scale(residual) * 10 + 50) %>% 
+    group_by(id) %>% 
+    summarise(r.isd = sd(residual, na.rm = TRUE),
+           n = n(),
+           task = var) %>% 
+    mutate(timepoint = "recovery_day1") %>% 
+    ungroup()
+  
+  # Merge all variables
+ recovery_day1_clean <- rbind(recovery_day1_clean, recovery_day1)
+}
+
+```
+
+### Recovery (recovery_day7)
+```{r}
+# Empty dataframe in for loop
+recovery_day7_clean = as_tibble()
+
+# For loop to run lm and extract residuals for each task residuals 
+for(var in c("flanker_con", "flanker_incon", "proc_speed", "dccs_mixed")){
+  
+  # Select only recovery_day7 data and remove NAs
+  recovery_day7 <- all_data_imp_final %>%
+    filter(timepoint == "recovery_day7") %>% 
+    select(id, timepoint, age, trial, .data[[var]]) %>%
+    drop_na()
+  
+  # Regression formula
+  form <- paste(var, " ~ age + trial + age*trial", sep = "")
+  
+  # Bias-free residuals
+  recovery_day7$residual <- resid(lm(form, recovery_day7))
+ 
+  # Transform to T score
+  recovery_day7 <- recovery_day7 %>% 
+    mutate(residual = scale(residual) * 10 + 50) %>% 
+    group_by(id) %>% 
+    summarise(r.isd = sd(residual, na.rm = TRUE),
+           n = n(),
+           task = var) %>% 
+    mutate(timepoint = "recovery_day7") %>% 
+    ungroup()
+  
+  # Merge all variables
+ recovery_day7_clean <- rbind(recovery_day7_clean, recovery_day7)
+}
+
+# Merging R-ISD data
+r.isd <- rbind(baseline_day1_clean, baseline_day5_clean, intervention_day7_clean, recovery_day1_clean, recovery_day7_clean)
+
+```
+
+### Computing final IIV dataset for analysis
+```{r, message=FALSE}
+# Computing mean, SD, and cov after outlier removal and imputation in raw data
+all_data_imp_long <- all_data_imp_final %>% 
+  pivot_longer(7:10, names_to = "task", values_to = "responsetime") %>% 
+  filter(is.na(responsetime)==FALSE) %>% 
+  group_by(id, task, timepoint)  %>% 
+  summarise(mean_rt = mean(responsetime, na.rm = TRUE),
+           raw_isd = sd(responsetime, na.rm = TRUE),
+           icv = raw_isd/mean_rt,
+           n = n()) %>% 
+  ungroup()
+
+# Merge r.isd with mean RT data
+all_data_imp_all <- left_join(all_data_imp_long, r.isd)
+
+all_data_imp_all <- left_join(all_data_imp_all, csa_demo) 
+
+all_data_imp_all <- all_data_imp_all %>% 
+  relocate(id, group, age, sex, task, timepoint, n, mean_rt, raw_isd, icv, r.isd)
+
+
+```
+
+### Double-checking
+```{r, message=FALSE}
+ # Checking that id matches pattern
+all_data_imp_complete %>% 
+  filter(str_detect(id, "CSA_[0-9]{2}")==FALSE)
+
+# Checking number of observations
+all_data_imp_complete %>% 
+  distinct(id,timepoint) %>% 
+  count(timepoint)
+
+# Plotting R-ISD and raw ISD to make sure they are similar
+
+all_data_imp_complete %>% 
+  ggplot(aes(x = r.isd, y = raw_isd, colour = task)) + 
+  geom_point() +
+  geom_smooth(method=lm) +
+  facet_wrap(~ timepoint)
+
+
+```
+
+## Exploring the data
+### Separating datasets per task
+```{r, message = FALSE}
+
+data_proc_speed_corrects <- all_data_imp_complete %>% 
+  filter(task == "proc_speed")
+
+data_flanker_con_corrects <- all_data_imp_complete %>% 
+  filter(task == "flanker_con")
+
+data_flanker_incon_corrects <- all_data_imp_complete %>% 
+  filter(task == "flanker_incon")
+
+data_flanker_inter <- all_data_imp_complete %>% 
+  filter(task == "flanker_inter")
+
+data_dccs_mixed_corrects <- all_data_imp_complete %>% 
+  filter(task == "dccs_mixed")
+
+```
+
+### Histograms
+#### Processing speed
+```{r, fig.height = 6, fig.width = 5}
+
+## Histogram R-ISD
+
+ggplot(data_proc_speed_corrects, aes(x = timepoint, y = r.isd, fill = timepoint)) + 
+  ggdist::stat_halfeye(
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.2, 
+    point_colour = NA
+  ) + 
+  geom_boxplot(
+    width = .15, 
+    outlier.shape = NA
+  ) +
+  ## add justified jitter from the {gghalves} package
+  gghalves::geom_half_point(aes(color = timepoint),
+    ## draw jitter on the left
+    side = "l", 
+    ## control range of jitter
+    range_scale = .4, 
+    ## add some transparency
+    alpha = .3) +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  theme(legend.position="none") +
+  ggtitle("Processing speed R-ISD")
+
+## Histogram raw ISD
+
+ggplot(data_proc_speed_corrects, aes(x = timepoint, y = raw_isd, fill = timepoint)) + 
+  ggdist::stat_halfeye(
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.2, 
+    point_colour = NA
+  ) + 
+  geom_boxplot(
+    width = .15, 
+    outlier.shape = NA
+  ) +
+  ## add justified jitter from the {gghalves} package
+  gghalves::geom_half_point(aes(color = timepoint),
+    ## draw jitter on the left
+    side = "l", 
+    ## control range of jitter
+    range_scale = .4, 
+    ## add some transparency
+    alpha = .3) +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  theme(legend.position="none") +
+  ggtitle("Processing speed raw ISD")
+
+## Histogram ICV
+
+ggplot(data_proc_speed_corrects, aes(x = timepoint, y = icv, fill = timepoint)) + 
+  ggdist::stat_halfeye(
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.2, 
+    point_colour = NA
+  ) + 
+  geom_boxplot(
+    width = .15, 
+    outlier.shape = NA
+  ) +
+  ## add justified jitter from the {gghalves} package
+  gghalves::geom_half_point(aes(color = timepoint),
+    ## draw jitter on the left
+    side = "l", 
+    ## control range of jitter
+    range_scale = .4, 
+    ## add some transparency
+    alpha = .3) +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  theme(legend.position="none") +
+  ggtitle("Processing speed ICV")
+
+```
+\newpage
+#### Flanker congruent
+```{r, fig.height = 6, fig.width = 5}
+
+## Histogram raw ISD
+ggplot(data_flanker_con_corrects, aes(x = timepoint, y = raw_isd, fill = timepoint)) + 
+  ggdist::stat_halfeye(
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.2, 
+    point_colour = NA
+  ) + 
+  geom_boxplot(
+    width = .15, 
+    outlier.shape = NA
+  ) +
+  ## add justified jitter from the {gghalves} package
+  gghalves::geom_half_point(aes(color = timepoint),
+    ## draw jitter on the left
+    side = "l", 
+    ## control range of jitter
+    range_scale = .4, 
+    ## add some transparency
+    alpha = .3) +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  theme(legend.position="none") +
+  ggtitle("Flanker Congruent raw ISD")
+
+## Histogram R-ISD
+ggplot(data_flanker_con_corrects, aes(x = timepoint, y = r.isd, fill = timepoint)) + 
+  ggdist::stat_halfeye(
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.2, 
+    point_colour = NA
+  ) + 
+  geom_boxplot(
+    width = .15, 
+    outlier.shape = NA
+  ) +
+  ## add justified jitter from the {gghalves} package
+  gghalves::geom_half_point(aes(color = timepoint),
+    ## draw jitter on the left
+    side = "l", 
+    ## control range of jitter
+    range_scale = .4, 
+    ## add some transparency
+    alpha = .3) +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  theme(legend.position="none") +
+  ggtitle("Flanker Congruent R-ISD")
+
+## Histogram ICV
+ggplot(data_flanker_con_corrects, aes(x = timepoint, y = icv, fill = timepoint)) + 
+  ggdist::stat_halfeye(
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.2, 
+    point_colour = NA
+  ) + 
+  geom_boxplot(
+    width = .15, 
+    outlier.shape = NA
+  ) +
+  ## add justified jitter from the {gghalves} package
+  gghalves::geom_half_point(aes(color = timepoint),
+    ## draw jitter on the left
+    side = "l", 
+    ## control range of jitter
+    range_scale = .4, 
+    ## add some transparency
+    alpha = .3) +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  theme(legend.position="none") +
+  ggtitle("Flanker Congruent ICV")
+
+```
+\newpage
+#### Flanker incongruent
+```{r, fig.height = 6, fig.width = 5}
+
+## Histogram raw ISD
+ggplot(data_flanker_incon_corrects, aes(x = timepoint, y = raw_isd, fill = timepoint)) + 
+  ggdist::stat_halfeye(
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.2, 
+    point_colour = NA
+  ) + 
+  geom_boxplot(
+    width = .15, 
+    outlier.shape = NA
+  ) +
+  ## add justified jitter from the {gghalves} package
+  gghalves::geom_half_point(aes(color = timepoint),
+    ## draw jitter on the left
+    side = "l", 
+    ## control range of jitter
+    range_scale = .4, 
+    ## add some transparency
+    alpha = .3) +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  theme(legend.position="none") +
+  ggtitle("Flanker Incongruent raw ISD")
+
+## Histogram R-ISD
+ggplot(data_flanker_incon_corrects, aes(x = timepoint, y = r.isd, fill = timepoint)) + 
+  ggdist::stat_halfeye(
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.2, 
+    point_colour = NA
+  ) + 
+  geom_boxplot(
+    width = .15, 
+    outlier.shape = NA
+  ) +
+  ## add justified jitter from the {gghalves} package
+  gghalves::geom_half_point(aes(color = timepoint),
+    ## draw jitter on the left
+    side = "l", 
+    ## control range of jitter
+    range_scale = .4, 
+    ## add some transparency
+    alpha = .3) +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  theme(legend.position="none") +
+  ggtitle("Flanker Incongruent R-ISD")
+
+## Histogram ICV
+ggplot(data_flanker_incon_corrects, aes(x = timepoint, y = icv, fill = timepoint)) + 
+  ggdist::stat_halfeye(
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.2, 
+    point_colour = NA
+  ) + 
+  geom_boxplot(
+    width = .15, 
+    outlier.shape = NA
+  ) +
+  ## add justified jitter from the {gghalves} package
+  gghalves::geom_half_point(aes(color = timepoint),
+    ## draw jitter on the left
+    side = "l", 
+    ## control range of jitter
+    range_scale = .4, 
+    ## add some transparency
+    alpha = .3) +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  theme(legend.position="none") +
+  ggtitle("Flanker Incongruent ICV")
+
+```
+
+\newpage
+#### DCCS mixed
+```{r, fig.height = 6, fig.width = 5}
+
+## Histogram raw ISD
+ggplot(data_dccs_mixed_corrects, aes(x = timepoint, y = raw_isd, fill = timepoint)) + 
+  ggdist::stat_halfeye(
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.2, 
+    point_colour = NA
+  ) + 
+  geom_boxplot(
+    width = .15, 
+    outlier.shape = NA
+  ) +
+  ## add justified jitter from the {gghalves} package
+  gghalves::geom_half_point(aes(color = timepoint),
+    ## draw jitter on the left
+    side = "l", 
+    ## control range of jitter
+    range_scale = .4, 
+    ## add some transparency
+    alpha = .3) +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  theme(legend.position="none") +
+  ggtitle("DCCS mixed raw ISD")
+
+## Histogram R-ISD
+ggplot(data_dccs_mixed_corrects, aes(x = timepoint, y = r.isd, fill = timepoint)) + 
+  ggdist::stat_halfeye(
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.2, 
+    point_colour = NA
+  ) + 
+  geom_boxplot(
+    width = .15, 
+    outlier.shape = NA
+  ) +
+  ## add justified jitter from the {gghalves} package
+  gghalves::geom_half_point(aes(color = timepoint),
+    ## draw jitter on the left
+    side = "l", 
+    ## control range of jitter
+    range_scale = .4, 
+    ## add some transparency
+    alpha = .3) +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  theme(legend.position="none") +
+  ggtitle("DCCS mixed R-ISD")
+
+## Histogram ICV
+ggplot(data_dccs_mixed_corrects, aes(x = timepoint, y = icv, fill = timepoint)) + 
+  ggdist::stat_halfeye(
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.2, 
+    point_colour = NA
+  ) + 
+  geom_boxplot(
+    width = .15, 
+    outlier.shape = NA
+  ) +
+  ## add justified jitter from the {gghalves} package
+  gghalves::geom_half_point(aes(color = timepoint),
+    ## draw jitter on the left
+    side = "l", 
+    ## control range of jitter
+    range_scale = .4, 
+    ## add some transparency
+    alpha = .3) +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  theme(legend.position="none") +
+  ggtitle("DCCS mixed ICV")
+
+```
+\newpage
+## Spaghetti
+### Intraindividual Coefficient of variation
+```{r, fig.height = 6, fig.width = 5}
+
+all_data_imp_complete %>%
+  ggplot(aes(x = timepoint, y = icv,  group = id)) +
+  geom_point(aes(color = id)) + 
+  geom_line(aes(color = id)) + 
+  stat_summary(aes(group = 1), 
+               geom = "point", 
+               fun = mean,
+               shape = 17, size = 3, color = "red") +
+    stat_smooth(aes(group = 1), color = "red") +
+  theme(legend.position = "none") +
+  facet_wrap(~ task)
+
+```
+\newpage
+### R-ISD
+```{r, fig.height = 6, fig.width = 5}
+
+all_data_imp_complete %>%
+  ggplot(aes(x = timepoint, y = r.isd,  group = id)) +
+  geom_point(aes(color = id)) + 
+  geom_line(aes(color = id)) + 
+  stat_summary(aes(group = 1), 
+               geom = "point", 
+               fun = mean,
+               shape = 17, size = 3, color = "red") +
+    stat_smooth(aes(group = 1), color = "red") +
+  theme(legend.position = "none") +
+  facet_wrap(~ task)
+
+```
+\newpage
+## Save final IIV dataset
+```{r, message=FALSE}
+
+write.csv(all_data_imp_complete, "csa_nih_toolbox_iiv_20230120.csv")
+
+```
+
+# Summary scores
+## Loading and cleaning summary score data
+```{r, message = FALSE}
+
+nih_toolbox_summary_scores <- read.xlsx("../my_spreadsheets/csa_nih_toolbox_raw_summary_scores_20230118.xlsx")
+
+nih_toolbox_summary_scores <- nih_toolbox_summary_scores %>% 
+  rename_all(tolower) %>% 
+  rename("proc_speed_raw_score" = "pcps.rawscore",
+         "proc_speed_computed_score" = "pcps.computed.score",
+         "proc_speed_uncorr_std_score" = "pspc.uncorrected.standard.score",
+         "proc_speed_fullycorrect_tscore" = "pspc.fully-corrected.t-score",
+         "proc_speed_agecorrect_tscore" = "pspc.age-corrected.standard.score",
+         "flanker_raw_score" = "flanker.rawscore",
+         "flanker_computed_score" = "flanker.computed.score",
+         "flanker_uncorr_std_score" = "flanker.uncorrected.standard.score",
+         "flanker_fullycorrect_tscore" = "flanker.fully-corrected.t-score",
+         "flanker_agecorrect_tscore" = "flanker.age-corrected.standard.score",
+         "dccs_raw_score" = "dccs.rawscore",
+         "dccs_computed_score" = "dccs.computed.score",
+         "dccs_uncorr_std_score" = "dccs.uncorrected.standard.score",
+         "dccs_fullycorrect_tscore" = "dccs.fully-corrected.t-score",
+         "dccs_agecorrect_tscore" = "dccs.age-corrected.standard.score") %>%
+  mutate(timepoint = ifelse(str_detect(timepoint, "1"), str_sub("baseline_day1"), timepoint),
+         timepoint = ifelse(str_detect(timepoint, "2"), str_sub("baseline_dayX"), timepoint),
+         timepoint = ifelse(str_detect(timepoint, "3"), str_sub("intervention_day7"), timepoint),
+         timepoint = ifelse(str_detect(timepoint, "4"), str_sub("recovery_day1"), timepoint),
+         timepoint = ifelse(str_detect(timepoint, "5"), str_sub("recovery_day7"), timepoint),
+         timepoint = ifelse(str_detect(timepoint, "baseline_dayX"), str_sub("baseline_day5"), timepoint))
+         
+```
+
+## Pivoting to long format
+```{r, message = FALSE}
+
+nih_toolbox_summary_scores_long <- nih_toolbox_summary_scores %>%
+  pivot_longer(3:17, names_to = "task", values_to = "summary_score")
+         
+```
+
+## Separating datasets per task
+
+```{r, message = FALSE}
+
+proc_speed_fullycorrected <- nih_toolbox_summary_scores_long %>% 
+  filter(task == "proc_speed_fullycorrect_tscore")
+
+flanker_fullycorrected <- nih_toolbox_summary_scores_long %>% 
+  filter(task == "flanker_fullycorrect_tscore")
+
+dccs_fullycorrected <- nih_toolbox_summary_scores_long %>% 
+  filter(task == "dccs_fullycorrect_tscore")
+
+```
+
+## Exploring the data
+### Histograms
+#### Processing speed
+```{r, fig.height = 6, fig.width = 5}
+
+ggplot(proc_speed_fullycorrected, aes(x = timepoint, y = summary_score, fill = timepoint)) + 
+  ggdist::stat_halfeye(
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.2, 
+    point_colour = NA
+  ) + 
+  geom_boxplot(
+    width = .15, 
+    outlier.shape = NA
+  ) +
+  ## add justified jitter from the {gghalves} package
+  gghalves::geom_half_point(aes(color = timepoint),
+    ## draw jitter on the left
+    side = "l", 
+    ## control range of jitter
+    range_scale = .4, 
+    ## add some transparency
+    alpha = .3) +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  theme(legend.position="none") +
+  ggtitle("Processing speed fully-corrected score")
+
+```
+\newpage
+#### Flanker
+```{r, fig.height = 6, fig.width = 5}
+
+ggplot(flanker_fullycorrected, aes(x = timepoint, y = summary_score, fill = timepoint)) + 
+  ggdist::stat_halfeye(
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.2, 
+    point_colour = NA
+  ) + 
+  geom_boxplot(
+    width = .15, 
+    outlier.shape = NA
+  ) +
+  ## add justified jitter from the {gghalves} package
+  gghalves::geom_half_point(aes(color = timepoint),
+    ## draw jitter on the left
+    side = "l", 
+    ## control range of jitter
+    range_scale = .4, 
+    ## add some transparency
+    alpha = .3) +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  theme(legend.position="none") +
+  ggtitle("Flanker fully-corrected score")
+
+```
+\newpage
+#### DCCS
+```{r, fig.height = 6, fig.width = 5}
+
+ggplot(dccs_fullycorrected, aes(x = timepoint, y = summary_score, fill = timepoint)) + 
+  ggdist::stat_halfeye(
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.2, 
+    point_colour = NA
+  ) + 
+  geom_boxplot(
+    width = .15, 
+    outlier.shape = NA
+  ) +
+  ## add justified jitter from the {gghalves} package
+  gghalves::geom_half_point(aes(color = timepoint),
+    ## draw jitter on the left
+    side = "l", 
+    ## control range of jitter
+    range_scale = .4, 
+    ## add some transparency
+    alpha = .3) +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  theme(legend.position="none") +
+  ggtitle("DCCS fully-corrected score")
+
+```
+\newpage
+### Spaghetti plot
+```{r, fig.height = 6, fig.width = 5}
+
+nih_toolbox_summary_scores_long %>%
+  ggplot(aes(x = timepoint, y = summary_score,  group = id)) +
+  geom_point(aes(color = id)) + 
+  geom_line(aes(color = id)) + 
+  stat_summary(aes(group = 1), 
+               geom = "point", 
+               fun = mean,
+               shape = 17, size = 3, color = "red") +
+    stat_smooth(aes(group = 1), color = "red") +
+  theme(legend.position = "none") +
+  facet_wrap(~ task)
+
+```
+\newpage
+## Merging NIH data with demographics to create models
+```{r}
+
+csa_demo <- read.csv("../my_spreadsheets/csa_demographics_20230117.csv") 
+
+nih_toolbox_summary_scores_long <- left_join(nih_toolbox_summary_scores_long, csa_demo, by = "id") 
+
+nih_toolbox_summary_scores_long <- nih_toolbox_summary_scores_long %>% 
+  mutate(across(group, as_factor)) %>% 
+  mutate(across(sex, as_factor)) %>% 
+  relocate(id,	group,	age,	sex,	education,	height_cm,	height_m,	weight_kg,	bmi,	current_marital_status,	living_arragement,	current_work_status,	current_job,	main_occupation_for_most_of_adult_life,	level_of_education,	pase, timepoint, task, summary_score)
+
+```
+
+## Saving final dataset
+```{r, message = FALSE}
+
+write.xlsx(nih_toolbox_summary_scores_long, "csa_nih_toolbox_summaryscores_20230119.xlsx", overwrite = TRUE)
+
+```
+
+# Linear mixed models
+## IIV metrics
+### Loading the data
+```{r, message = FALSE}
+
+all_data_nih_toolbox <- read_csv("../my_spreadsheets/csa_nih_toolbox_iiv_20230120.csv", 
+                         show_col_types = FALSE,
+                         name_repair = make_clean_names) %>% 
+  glimpse()
+
+pase <- read_csv("../my_spreadsheets/csa_pase_scored.csv", 
+                         show_col_types = FALSE,
+                         name_repair = make_clean_names,
+                         col_select = c(id, pase_total)) %>% 
+  glimpse()
+
+pase <- pase %>% 
+  mutate(id = tolower(id))
+
+bmi_fat_vo2 <- read_csv("../my_spreadsheets/csa_demographics_20230117.csv", 
+                         show_col_types = FALSE,
+                         name_repair = make_clean_names,
+                         col_select = c(id, bmi, vo2_peak_ml_min_kg,	pct_fat_total)) %>% 
+  glimpse()
+
+bmi_fat_vo2 <- bmi_fat_vo2 %>% 
+  mutate(id = tolower(id)) %>% 
+  glimpse()
+
+all_data_nih_toolbox <- all_data_nih_toolbox %>% 
+  arrange(id) %>% 
+  dplyr::select(-n) %>%
+  mutate(id = tolower(id)) %>% 
+  glimpse()
+
+all_data_nih_toolbox <- left_join(all_data_nih_toolbox, pase, by = "id") %>% 
+  glimpse()
+
+all_data_nih_toolbox <- left_join(all_data_nih_toolbox, bmi_fat_vo2, by = "id") 
+
+all_data_nih_toolbox <- all_data_nih_toolbox %>% 
+  relocate(id,	group,	age,	sex, bmi, vo2_peak_ml_min_kg, pct_fat_total, pase_total) %>% 
+  glimpse() 
+
+```
+
+### Data distribution
+#### Plotting raw coefficient of variation
+```{r, fig.height = 6, fig.width = 5}
+
+all_data_nih_toolbox %>%
+  dplyr::select(id, task, group, timepoint, icv) %>% 
+  ggplot(aes(icv, fill = group)) +
+  geom_boxplot(aes(ymin = -10), width = 6, alpha = 0.8) +
+  geom_density(alpha = 0.8, colour = "black") +
+  facet_grid(timepoint~task) +
+  scale_fill_manual(values = c("#9B50DD", "#9BD99A")) +
+  theme_light() +
+  xlab("Coefficient of variation") +
+  ylab("") +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(colour = "black", size = 10),
+    axis.text.y = element_blank())
+
+```
+
+#### Plotting raw ISD
+```{r, fig.height = 6, fig.width = 5}
+
+all_data_nih_toolbox %>%
+  dplyr::select(id, task, group, timepoint, raw_isd) %>% 
+  ggplot(aes(raw_isd, fill = group)) +
+  geom_boxplot(aes(ymin = -0.5), width = 0.5, alpha = 0.8) +
+  geom_density(adjust = 1/2, alpha = 0.8, colour = "black") +
+  facet_grid(timepoint~task) +
+  scale_fill_manual(values = c("#9B50DD", "#9BD99A")) +
+  theme_light() +
+  xlab("ISD") +
+  ylab("") +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(colour = "black", size = 10),
+    axis.text.y = element_blank())
+
+```
+
+#### Plotting residualized ISD
+```{r, fig.height = 6, fig.width = 5}
+
+all_data_nih_toolbox %>%
+  dplyr::select(id, task, group, timepoint, res_isd) %>% 
+  ggplot(aes(res_isd, fill = group)) +
+  geom_boxplot(aes(ymin = -0.5), width = 0.5, alpha = 0.8) +
+  geom_density(adjust = 1/2, alpha = 0.8, colour = "black") +
+  facet_grid(timepoint~task) +
+  scale_fill_manual(values = c("#9B50DD", "#9BD99A")) +
+  theme_light() +
+  xlab("R-ISD") +
+  ylab("") +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(colour = "black", size = 10),
+    axis.text.y = element_blank())
+
+```
+
+### Organizing the data
+```{r}
+
+# Create a single baseline variable (averaging the two baselines) and incorporate it 
+all_data_nih_toolbox_b <- all_data_nih_toolbox %>% 
+  group_by(id, task, timepoint) %>% 
+  mutate(timepoint = str_replace(timepoint, "baseline_day1", "baseline_day5")) %>% 
+  mutate(mean_rt = mean(mean_rt),
+         raw_isd = mean(raw_isd),
+         icv = mean(icv),
+         res_isd = mean(res_isd)) %>% 
+  mutate(timepoint = str_replace(timepoint, "baseline_day5", "baseline_avg")) %>%
+  ungroup() %>% 
+  distinct(mean_rt, .keep_all = TRUE)
+
+
+# Pivot VoI of interest to wide
+all_data_nih_toolbox_wide <- all_data_nih_toolbox_b %>% 
+  pivot_wider(names_from = task, values_from = c(mean_rt, raw_isd, icv, res_isd)) %>%
+  pivot_wider(names_from = timepoint, values_from = c(10:29)) # values from mean_rt, raw_isd, icv, res_isd, catech columns from previous row
+
+
+# Creating time varying datasets
+all_data_nih_toolbox_wide_lmm <- all_data_nih_toolbox_wide %>%  # Time varying variables of interest (mean_rt, raw_isd, res_isd, icv)
+  dplyr::select(-c(contains("baseline_day1"))) %>% 
+  dplyr::select(-c(contains("baseline_day5")))
+
+# Replacing names to make it possible for the next step
+all_data_nih_toolbox_wide_lmm <- all_data_nih_toolbox_wide %>% 
+  rename_all( ~ str_replace(., "_intervention_day7", paste0(".2"))) %>% 
+  rename_all( ~ str_replace(., "_recovery_day1", paste0(".3"))) %>% 
+  rename_all( ~ str_replace(., "_recovery_day7", paste0(".4"))) %>% 
+  rename_all( ~ str_replace(., "_baseline_avg", paste0(".baseline"))) %>% 
+  mutate(across(where(is.numeric), ~ round(., 3))) %>% 
+  relocate(contains("baseline"), .after = last_col())
+  
+# Reshape to long data frame with intervention_day7, recovery_day1, and recovery_day7 as repeated outcomes and baseline as separate time-invariant
+all_data_nih_toolbox_long_lmm <- reshape(as.data.frame(all_data_nih_toolbox_wide_lmm),idvar="id",varying=9:68,direction="long",sep=".") 
+
+```
+
+#### Dataset for plotting (extracting baseline M and SE)
+```{r}
+
+# Summarise M and SD
+all_data_nih_toolbox_baseline_mean_sd <- all_data_nih_toolbox_long_lmm  %>% 
+  slice(1:22) %>% 
+  group_by(group) %>% 
+  summarise(mean_rt_mean_rt_flanker_con_baseline = mean(mean_rt_flanker_con.baseline),
+            sd_rt_mean_rt_flanker_con_baseline = sd(mean_rt_flanker_con.baseline),
+            mean_rt_mean_rt_flanker_incon_baseline = mean(mean_rt_flanker_incon.baseline),
+            sd_rt_mean_rt_flanker_incon_baseline = sd(mean_rt_flanker_incon.baseline),
+            mean_rt_mean_rt_dccs_mixed_baseline = mean(mean_rt_dccs_mixed.baseline),
+            sd_rt_mean_rt_dccs_mixed_baseline = sd(mean_rt_dccs_mixed.baseline),
+            mean_rt_mean_rt_proc_speed_baseline = mean(mean_rt_proc_speed.baseline),
+            sd_rt_mean_rt_proc_speed_baseline = sd(mean_rt_proc_speed.baseline),
+            mean_rt_raw_isd_flanker_con_baseline = mean(raw_isd_flanker_con.baseline),
+            sd_rt_raw_isd_flanker_con_baseline = sd(raw_isd_flanker_con.baseline),
+            mean_rt_raw_isd_flanker_incon_baseline = mean(raw_isd_flanker_incon.baseline),
+            sd_rt_raw_isd_flanker_incon_baseline = sd(raw_isd_flanker_incon.baseline),
+            mean_rt_raw_isd_dccs_mixed_baseline = mean(raw_isd_dccs_mixed.baseline),
+            sd_rt_raw_isd_dccs_mixed_baseline = sd(raw_isd_dccs_mixed.baseline),
+            mean_rt_raw_isd_proc_speed_baseline = mean(raw_isd_proc_speed.baseline),
+            sd_rt_raw_isd_proc_speed_baseline = sd(raw_isd_proc_speed.baseline),
+            mean_rt_icv_flanker_con_baseline = mean(icv_flanker_con.baseline),
+            sd_rt_icv_flanker_con_baseline = sd(icv_flanker_con.baseline),
+            mean_rt_icv_flanker_incon_baseline = mean(icv_flanker_incon.baseline),
+            sd_rt_icv_flanker_incon_baseline = sd(icv_flanker_incon.baseline),
+            mean_rt_icv_dccs_mixed_baseline = mean(icv_dccs_mixed.baseline),
+            sd_rt_icv_dccs_mixed_baseline = sd(icv_dccs_mixed.baseline),
+            mean_rt_icv_proc_speed_baseline = mean(icv_proc_speed.baseline),
+            sd_rt_icv_proc_speed_baseline = sd(icv_proc_speed.baseline),
+            mean_rt_res_isd_flanker_con_baseline = mean(res_isd_flanker_con.baseline),
+            sd_rt_res_isd_flanker_con_baseline = sd(res_isd_flanker_con.baseline),
+            mean_rt_res_isd_flanker_incon_baseline = mean(res_isd_flanker_incon.baseline),
+            sd_rt_res_isd_flanker_incon_baseline = sd(res_isd_flanker_incon.baseline),
+            mean_rt_res_isd_dccs_mixed_baseline = mean(res_isd_dccs_mixed.baseline),
+            sd_rt_res_isd_dccs_mixed_baseline = sd(res_isd_dccs_mixed.baseline),
+            mean_rt_res_isd_proc_speed_baseline = mean(res_isd_proc_speed.baseline),
+            sd_rt_res_isd_proc_speed_baseline = sd(res_isd_proc_speed.baseline)) %>% 
+  ungroup()
+
+all_data_nih_toolbox_baseline_sd <- all_data_nih_toolbox_baseline_mean_sd %>% 
+  dplyr::select(starts_with("group") | starts_with("sd"))
+
+
+# Transform SD to SE
+all_data_nih_toolbox_baseline_mean_se <- all_data_nih_toolbox_baseline_mean_sd %>% # n = 23
+  group_by(group) %>% 
+  mutate(se_rt_mean_rt_flanker_con_baseline = (sd_rt_mean_rt_flanker_con_baseline/sqrt(23)),
+         se_rt_mean_rt_flanker_incon_baseline = (sd_rt_mean_rt_flanker_incon_baseline/sqrt(23)),
+         se_rt_mean_rt_dccs_mixed_baseline = (sd_rt_mean_rt_dccs_mixed_baseline/sqrt(23)),
+         se_rt_mean_rt_proc_speed_baseline = (sd_rt_mean_rt_proc_speed_baseline/sqrt(23)),
+         se_rt_raw_isd_flanker_con_baseline = (sd_rt_raw_isd_flanker_con_baseline/sqrt(23)),
+         se_rt_raw_isd_flanker_incon_baseline = (sd_rt_raw_isd_flanker_incon_baseline/sqrt(23)),
+         se_rt_raw_isd_dccs_mixed_baseline = (sd_rt_raw_isd_dccs_mixed_baseline/sqrt(23)),
+         se_rt_raw_isd_proc_speed_baseline = (sd_rt_raw_isd_proc_speed_baseline/sqrt(23)),
+         se_rt_icv_flanker_con_baseline = (sd_rt_icv_flanker_con_baseline/sqrt(23)),
+         se_rt_icv_flanker_incon_baseline = (sd_rt_icv_flanker_incon_baseline/sqrt(23)),
+         se_rt_icv_dccs_mixed_baseline = (sd_rt_icv_dccs_mixed_baseline/sqrt(23)),
+         se_rt_icv_proc_speed_baseline = (sd_rt_icv_proc_speed_baseline/sqrt(23)),
+         se_rt_res_isd_flanker_con_baseline = (sd_rt_res_isd_flanker_con_baseline/sqrt(23)),
+         se_rt_res_isd_flanker_incon_baseline = (sd_rt_res_isd_flanker_incon_baseline/sqrt(23)),
+         se_rt_res_isd_dccs_mixed_baseline = (sd_rt_res_isd_dccs_mixed_baseline/sqrt(23)),
+         se_rt_res_isd_proc_speed_baseline = (sd_rt_res_isd_proc_speed_baseline/sqrt(23))) %>% 
+  dplyr::select(-(starts_with("sd_rt"))) %>% 
+  ungroup()
+
+
+```
+
+###### Dataset for plotting by sex (extracting baseline M and SE)
+```{r}
+
+# Summarise M and SD
+all_data_nih_toolbox_baseline_sex_mean_sd <- all_data_nih_toolbox_long_lmm  %>% 
+  slice(1:22) %>% 
+  group_by(group, sex) %>% 
+  summarise(mean_rt_mean_rt_flanker_con_baseline = mean(mean_rt_flanker_con.baseline),
+            sd_rt_mean_rt_flanker_con_baseline = sd(mean_rt_flanker_con.baseline),
+            mean_rt_mean_rt_flanker_incon_baseline = mean(mean_rt_flanker_incon.baseline),
+            sd_rt_mean_rt_flanker_incon_baseline = sd(mean_rt_flanker_incon.baseline),
+            mean_rt_mean_rt_dccs_mixed_baseline = mean(mean_rt_dccs_mixed.baseline),
+            sd_rt_mean_rt_dccs_mixed_baseline = sd(mean_rt_dccs_mixed.baseline),
+            mean_rt_mean_rt_proc_speed_baseline = mean(mean_rt_proc_speed.baseline),
+            sd_rt_mean_rt_proc_speed_baseline = sd(mean_rt_proc_speed.baseline),
+            mean_rt_raw_isd_flanker_con_baseline = mean(raw_isd_flanker_con.baseline),
+            sd_rt_raw_isd_flanker_con_baseline = sd(raw_isd_flanker_con.baseline),
+            mean_rt_raw_isd_flanker_incon_baseline = mean(raw_isd_flanker_incon.baseline),
+            sd_rt_raw_isd_flanker_incon_baseline = sd(raw_isd_flanker_incon.baseline),
+            mean_rt_raw_isd_dccs_mixed_baseline = mean(raw_isd_dccs_mixed.baseline),
+            sd_rt_raw_isd_dccs_mixed_baseline = sd(raw_isd_dccs_mixed.baseline),
+            mean_rt_raw_isd_proc_speed_baseline = mean(raw_isd_proc_speed.baseline),
+            sd_rt_raw_isd_proc_speed_baseline = sd(raw_isd_proc_speed.baseline),
+            mean_rt_icv_flanker_con_baseline = mean(icv_flanker_con.baseline),
+            sd_rt_icv_flanker_con_baseline = sd(icv_flanker_con.baseline),
+            mean_rt_icv_flanker_incon_baseline = mean(icv_flanker_incon.baseline),
+            sd_rt_icv_flanker_incon_baseline = sd(icv_flanker_incon.baseline),
+            mean_rt_icv_dccs_mixed_baseline = mean(icv_dccs_mixed.baseline),
+            sd_rt_icv_dccs_mixed_baseline = sd(icv_dccs_mixed.baseline),
+            mean_rt_icv_proc_speed_baseline = mean(icv_proc_speed.baseline),
+            sd_rt_icv_proc_speed_baseline = sd(icv_proc_speed.baseline),
+            mean_rt_res_isd_flanker_con_baseline = mean(res_isd_flanker_con.baseline),
+            sd_rt_res_isd_flanker_con_baseline = sd(res_isd_flanker_con.baseline),
+            mean_rt_res_isd_flanker_incon_baseline = mean(res_isd_flanker_incon.baseline),
+            sd_rt_res_isd_flanker_incon_baseline = sd(res_isd_flanker_incon.baseline),
+            mean_rt_res_isd_dccs_mixed_baseline = mean(res_isd_dccs_mixed.baseline),
+            sd_rt_res_isd_dccs_mixed_baseline = sd(res_isd_dccs_mixed.baseline),
+            mean_rt_res_isd_proc_speed_baseline = mean(res_isd_proc_speed.baseline),
+            sd_rt_res_isd_proc_speed_baseline = sd(res_isd_proc_speed.baseline)) %>% 
+  ungroup()
+
+
+# Transform SD to SE
+all_data_nih_toolbox_baseline_sex_mean_se <- all_data_nih_toolbox_baseline_sex_mean_sd %>% # n = 23
+  group_by(group) %>% 
+  mutate(se_rt_mean_rt_flanker_con_baseline = (sd_rt_mean_rt_flanker_con_baseline/sqrt(23)),
+         se_rt_mean_rt_flanker_incon_baseline = (sd_rt_mean_rt_flanker_incon_baseline/sqrt(23)),
+         se_rt_mean_rt_dccs_mixed_baseline = (sd_rt_mean_rt_dccs_mixed_baseline/sqrt(23)),
+         se_rt_mean_rt_proc_speed_baseline = (sd_rt_mean_rt_proc_speed_baseline/sqrt(23)),
+         se_rt_raw_isd_flanker_con_baseline = (sd_rt_raw_isd_flanker_con_baseline/sqrt(23)),
+         se_rt_raw_isd_flanker_incon_baseline = (sd_rt_raw_isd_flanker_incon_baseline/sqrt(23)),
+         se_rt_raw_isd_dccs_mixed_baseline = (sd_rt_raw_isd_dccs_mixed_baseline/sqrt(23)),
+         se_rt_raw_isd_proc_speed_baseline = (sd_rt_raw_isd_proc_speed_baseline/sqrt(23)),
+         se_rt_icv_flanker_con_baseline = (sd_rt_icv_flanker_con_baseline/sqrt(23)),
+         se_rt_icv_flanker_incon_baseline = (sd_rt_icv_flanker_incon_baseline/sqrt(23)),
+         se_rt_icv_dccs_mixed_baseline = (sd_rt_icv_dccs_mixed_baseline/sqrt(23)),
+         se_rt_icv_proc_speed_baseline = (sd_rt_icv_proc_speed_baseline/sqrt(23)),
+         se_rt_res_isd_flanker_con_baseline = (sd_rt_res_isd_flanker_con_baseline/sqrt(23)),
+         se_rt_res_isd_flanker_incon_baseline = (sd_rt_res_isd_flanker_incon_baseline/sqrt(23)),
+         se_rt_res_isd_dccs_mixed_baseline = (sd_rt_res_isd_dccs_mixed_baseline/sqrt(23)),
+         se_rt_res_isd_proc_speed_baseline = (sd_rt_res_isd_proc_speed_baseline/sqrt(23))) %>% 
+  dplyr::select(-(starts_with("sd_rt"))) %>% 
+  ungroup()
+
+
+```
+
+\newpage
+### Raw ISD
+#### Flanker incongruent
+```{r}
+
+# Look at ICC first
+lmem_raw_isd_flanker_incon_icc <- lmer(raw_isd_flanker_incon ~ (1 | id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_raw_isd_flanker_incon_icc) 
+icc(lmem_raw_isd_flanker_incon_icc) # ICC (intercept/intercept+residual) = 0.08
+
+# LMEM
+lmem_raw_isd_flanker_incon <- lmer(raw_isd_flanker_incon ~ factor(group)*factor(time) + raw_isd_flanker_incon.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_raw_isd_flanker_incon)
+summ(lmem_raw_isd_flanker_incon)
+
+check_model(lmem_raw_isd_flanker_incon)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_flanker_incon <- lsmeans(lmem_raw_isd_flanker_incon, ~group|time)
+means_lmem_raw_isd_flanker_incon
+### Btw timepoint for each group (within-group)
+#### Baseline
+all_data_nih_toolbox_long_lmm %>% 
+  dplyr::select("id", "group","raw_isd_flanker_incon.baseline") %>% 
+  slice(1:23) %>%
+  group_by(group) %>% 
+  summarise(mean = mean(raw_isd_flanker_incon.baseline),
+            sd = sd(raw_isd_flanker_incon.baseline)) %>%
+  ungroup()
+#### BR, HDBR completion, end of recovery
+means_lmem_raw_isd_flanker_incon_within <- lsmeans(lmem_raw_isd_flanker_incon, ~time|group)
+means_lmem_raw_isd_flanker_incon_within
+
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_flanker_incon_contrasts <- contrast(means_lmem_raw_isd_flanker_incon, "trt.vs.ctrl", adj="none")
+means_lmem_raw_isd_flanker_incon_contrasts
+means_lmem_raw_isd_flanker_incon_contrasts_confint <- confint(means_lmem_raw_isd_flanker_incon_contrasts, parm, level = 0.95)
+means_lmem_raw_isd_flanker_incon_contrasts_confint
+### Btw timepoint for each group (within-group)
+means_lmem_raw_isd_flanker_incon_contrasts_within <- contrast(means_lmem_raw_isd_flanker_incon_within, adj="none")
+means_lmem_raw_isd_flanker_incon_contrasts_within
+
+# LMEM adjusted for baseline and sex 3-way interaction
+lmem_raw_isd_flanker_incon_sex <- lmer(raw_isd_flanker_incon ~ factor(group)*factor(time)*factor(sex) + raw_isd_flanker_incon.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_raw_isd_flanker_incon_sex)
+summ(lmem_raw_isd_flanker_incon_sex)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_flanker_incon_sex <- lsmeans(lmem_raw_isd_flanker_incon_sex, ~group|sex|time)
+means_lmem_raw_isd_flanker_incon_sex
+
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_flanker_incon_contrasts_sex <- contrast(means_lmem_raw_isd_flanker_incon_sex, "trt.vs.ctrl", adj="none")
+means_lmem_raw_isd_flanker_incon_contrasts_sex
+means_lmem_raw_isd_flanker_incon_contrasts_confint_sex <- confint(means_lmem_raw_isd_flanker_incon_contrasts_sex, parm, level = 0.95)
+means_lmem_raw_isd_flanker_incon_contrasts_confint_sex
+
+check_model(lmem_raw_isd_flanker_incon_sex)
+
+```
+
+###### Tables
+```{r, results = 'asis'}
+
+tab_model(lmem_raw_isd_flanker_incon, p.val = "kr", show.df = TRUE, show.stat = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+tab_model(lmem_raw_isd_flanker_incon_sex, p.val = "kr", show.df = TRUE, show.stat = TRUE)
+
+```
+
+\newpage
+#### Flanker congruent
+```{r}
+
+# Look at ICC first
+lmem_raw_isd_flanker_con_icc <- lmer(raw_isd_flanker_con ~ (1 | id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_raw_isd_flanker_con_icc) 
+icc(lmem_raw_isd_flanker_con_icc) # ICC (intercept/intercept+residual) = 0.28
+
+# LMEM
+lmem_raw_isd_flanker_con <- lmer(raw_isd_flanker_con ~ factor(group)*factor(time) + raw_isd_flanker_con.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_raw_isd_flanker_con)
+summ(lmem_raw_isd_flanker_con)
+
+check_model(lmem_raw_isd_flanker_con)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_flanker_con <- lsmeans(lmem_raw_isd_flanker_con, ~group|time)
+means_lmem_raw_isd_flanker_con
+### Btw timepoint for each group (within-group)
+#### Baseline
+all_data_nih_toolbox_long_lmm %>% 
+  dplyr::select("id", "group","raw_isd_flanker_con.baseline") %>% 
+  slice(1:23) %>%
+  group_by(group) %>% 
+  summarise(mean = mean(raw_isd_flanker_con.baseline),
+            sd = sd(raw_isd_flanker_con.baseline)) %>%
+  ungroup()
+#### BR, HDBR completion, end of recovery
+means_lmem_raw_isd_flanker_con_within <- lsmeans(lmem_raw_isd_flanker_con, ~time|group)
+means_lmem_raw_isd_flanker_con_within
+
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_flanker_con_contrasts <- contrast(means_lmem_raw_isd_flanker_con, "trt.vs.ctrl", adj="none")
+means_lmem_raw_isd_flanker_con_contrasts
+means_lmem_raw_isd_flanker_con_contrasts_confint <- confint(means_lmem_raw_isd_flanker_con_contrasts, parm, level = 0.95)
+means_lmem_raw_isd_flanker_con_contrasts_confint
+### Btw timepoint for each group (within-group)
+means_lmem_raw_isd_flanker_con_contrasts_within <- contrast(means_lmem_raw_isd_flanker_con_within, adj="none")
+means_lmem_raw_isd_flanker_con_contrasts_within
+
+# LMEM adjusted for baseline and sex 3-way interaction
+lmem_raw_isd_flanker_con_sex <- lmer(raw_isd_flanker_con ~ factor(group)*factor(time)*factor(sex) + raw_isd_flanker_con.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_raw_isd_flanker_con_sex)
+summ(lmem_raw_isd_flanker_con_sex)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_flanker_con_sex <- lsmeans(lmem_raw_isd_flanker_con_sex, ~group|sex|time)
+means_lmem_raw_isd_flanker_con_sex
+
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_flanker_con_contrasts_sex <- contrast(means_lmem_raw_isd_flanker_con_sex, "trt.vs.ctrl", adj="none")
+means_lmem_raw_isd_flanker_con_contrasts_sex
+means_lmem_raw_isd_flanker_con_contrasts_confint_sex <- confint(means_lmem_raw_isd_flanker_con_contrasts_sex, parm, level = 0.95)
+means_lmem_raw_isd_flanker_con_contrasts_confint_sex
+
+check_model(lmem_raw_isd_flanker_con_sex)
+
+```
+
+###### Tables
+```{r, results = 'asis'}
+
+tab_model(lmem_raw_isd_flanker_con, p.val = "kr", show.df = TRUE, show.stat = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+tab_model(lmem_raw_isd_flanker_con_sex, p.val = "kr", show.df = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+```
+
+\newpage
+#### DCCS mixed
+```{r}
+
+# Look at ICC first
+lmem_raw_isd_dccs_mixed_icc <- lmer(raw_isd_dccs_mixed ~ (1 | id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_raw_isd_dccs_mixed_icc) 
+icc(lmem_raw_isd_dccs_mixed_icc) # ICC (intercept/intercept+residual) = 0.66
+
+# LMEM
+lmem_raw_isd_dccs_mixed <- lmer(raw_isd_dccs_mixed ~ factor(group)*factor(time) + raw_isd_dccs_mixed.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_raw_isd_dccs_mixed)
+summ(lmem_raw_isd_dccs_mixed)
+
+check_model(lmem_raw_isd_dccs_mixed)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_dccs_mixed <- lsmeans(lmem_raw_isd_dccs_mixed, ~group|time)
+means_lmem_raw_isd_dccs_mixed
+### Btw timepoint for each group (within-group)
+#### Baseline
+all_data_nih_toolbox_long_lmm %>% 
+  dplyr::select("id", "group","raw_isd_dccs_mixed.baseline") %>% 
+  slice(1:23) %>%
+  group_by(group) %>% 
+  summarise(mean = mean(raw_isd_dccs_mixed.baseline),
+            sd = sd(raw_isd_dccs_mixed.baseline)) %>%
+  ungroup()
+#### BR, HDBR completion, end of recovery
+means_lmem_raw_isd_dccs_mixed_within <- lsmeans(lmem_raw_isd_dccs_mixed, ~time|group)
+means_lmem_raw_isd_dccs_mixed_within
+
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_dccs_mixed_contrasts <- contrast(means_lmem_raw_isd_dccs_mixed, "trt.vs.ctrl", adj="none")
+means_lmem_raw_isd_dccs_mixed_contrasts
+means_lmem_raw_isd_dccs_mixed_contrasts_confint <- confint(means_lmem_raw_isd_dccs_mixed_contrasts, parm, level = 0.95)
+means_lmem_raw_isd_dccs_mixed_contrasts_confint
+### Btw timepoint for each group (within-group)
+means_lmem_raw_isd_dccs_mixed_contrasts_within <- contrast(means_lmem_raw_isd_dccs_mixed_within, adj="none")
+means_lmem_raw_isd_dccs_mixed_contrasts_within
+
+# LMEM adjusted for baseline and sex 3-way interaction
+lmem_raw_isd_dccs_mixed_sex <- lmer(raw_isd_dccs_mixed ~ factor(group)*factor(time)*factor(sex) + raw_isd_dccs_mixed.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_raw_isd_dccs_mixed_sex)
+summ(lmem_raw_isd_dccs_mixed_sex)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_dccs_mixed_sex <- lsmeans(lmem_raw_isd_dccs_mixed_sex, ~group|sex|time)
+means_lmem_raw_isd_dccs_mixed_sex
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_dccs_mixed_contrasts_sex <- contrast(means_lmem_raw_isd_dccs_mixed_sex, "trt.vs.ctrl", adj="none")
+means_lmem_raw_isd_dccs_mixed_contrasts_sex
+means_lmem_raw_isd_dccs_mixed_contrasts_confint_sex <- confint(means_lmem_raw_isd_dccs_mixed_contrasts_sex, parm, level = 0.95)
+means_lmem_raw_isd_dccs_mixed_contrasts_confint_sex
+
+check_model(lmem_raw_isd_dccs_mixed_sex)
+```
+
+###### Tables
+```{r, results = 'asis'}
+
+tab_model(lmem_raw_isd_dccs_mixed, p.val = "kr", show.df = TRUE, show.stat = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+tab_model(lmem_raw_isd_dccs_mixed_sex, p.val = "kr", show.df = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+```
+
+\newpage
+#### Processing speed
+```{r}
+
+# Look at ICC first
+lmem_raw_isd_proc_speed_icc <- lmer(raw_isd_proc_speed ~ (1 | id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_raw_isd_proc_speed_icc) 
+icc(lmem_raw_isd_proc_speed_icc) # ICC (intercept/intercept+residual) = 0.35
+
+# LMEM
+lmem_raw_isd_proc_speed <- lmer(raw_isd_proc_speed ~ factor(group)*factor(time) + raw_isd_proc_speed.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_raw_isd_proc_speed)
+summ(lmem_raw_isd_proc_speed)
+
+check_model(lmem_raw_isd_proc_speed)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_proc_speed <- lsmeans(lmem_raw_isd_proc_speed, ~group|time)
+means_lmem_raw_isd_proc_speed
+### Btw timepoint for each group (within-group)
+#### Baseline
+all_data_nih_toolbox_long_lmm %>% 
+  dplyr::select("id", "group","raw_isd_proc_speed.baseline") %>% 
+  slice(1:23) %>%
+  group_by(group) %>% 
+  summarise(mean = mean(raw_isd_proc_speed.baseline),
+            sd = sd(raw_isd_proc_speed.baseline)) %>%
+  ungroup()
+#### BR, HDBR completion, end of recovery
+means_lmem_raw_isd_proc_speed_within <- lsmeans(lmem_raw_isd_proc_speed, ~time|group)
+means_lmem_raw_isd_proc_speed_within
+
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_proc_speed_contrasts <- contrast(means_lmem_raw_isd_proc_speed, "trt.vs.ctrl", adj="none")
+means_lmem_raw_isd_proc_speed_contrasts
+means_lmem_raw_isd_proc_speed_contrasts_confint <- confint(means_lmem_raw_isd_proc_speed_contrasts, parm, level = 0.95)
+means_lmem_raw_isd_proc_speed_contrasts_confint
+### Btw timepoint for each group (within-group)
+means_lmem_raw_isd_proc_speed_contrasts_within <- contrast(means_lmem_raw_isd_proc_speed_within, adj="none")
+means_lmem_raw_isd_proc_speed_contrasts_within
+
+# LMEM adjusted for baseline and sex 3-way interaction
+lmem_raw_isd_proc_speed_sex <- lmer(raw_isd_proc_speed ~ factor(group)*factor(time)*factor(sex) + raw_isd_proc_speed.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_raw_isd_proc_speed_sex)
+summ(lmem_raw_isd_proc_speed_sex)
+
+check_model(lmem_raw_isd_proc_speed_sex)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_proc_speed_sex <- lsmeans(lmem_raw_isd_proc_speed_sex, ~group|sex|time)
+means_lmem_raw_isd_proc_speed_sex
+
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_raw_isd_proc_speed_contrasts_sex <- contrast(means_lmem_raw_isd_proc_speed_sex, "trt.vs.ctrl", adj="none")
+means_lmem_raw_isd_proc_speed_contrasts_sex
+means_lmem_raw_isd_proc_speed_contrasts_confint_sex <- confint(means_lmem_raw_isd_proc_speed_contrasts_sex, parm, level = 0.95)
+means_lmem_raw_isd_proc_speed_contrasts_confint_sex
+
+```
+
+###### Tables
+```{r, results = 'asis'}
+
+tab_model(lmem_raw_isd_proc_speed, p.val = "kr", show.df = TRUE, show.stat = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+tab_model(lmem_raw_isd_proc_speed_sex, p.val = "kr", show.df = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+```
+
+\newpage
+### Coefficient of Variation (ICV)
+#### Flanker incongruent
+```{r}
+
+# Look at ICC first
+lmem_icv_flanker_incon_icc <- lmer(icv_flanker_incon ~ (1 | id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_icv_flanker_incon_icc) # ICC (intercept/intercept+residual) = 1
+
+# LMEM adjusting for baseline
+lmem_icv_flanker_incon <- lmer(icv_flanker_incon ~ factor(group)*factor(time) + icv_flanker_incon.baseline + pase_total + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_icv_flanker_incon)
+summ(lmem_icv_flanker_incon)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_icv_flanker_incon <- lsmeans(lmem_icv_flanker_incon, ~group|time)
+means_lmem_icv_flanker_incon
+### Btw timepoint for each group (within-group)
+#### Baseline
+all_data_nih_toolbox_long_lmm %>% 
+  dplyr::select("id", "group","icv_flanker_incon.baseline") %>% 
+  slice(1:23) %>%
+  group_by(group) %>% 
+  summarise(mean = mean(icv_flanker_incon.baseline),
+            sd = sd(icv_flanker_incon.baseline)) %>%
+  ungroup()
+#### BR, HDBR completion, end of recovery
+means_lmem_icv_flanker_incon_within <- lsmeans(lmem_icv_flanker_incon, ~time|group)
+means_lmem_icv_flanker_incon_within
+
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_icv_flanker_incon_contrasts <- contrast(means_lmem_icv_flanker_incon, "trt.vs.ctrl", adj="none")
+means_lmem_icv_flanker_incon_contrasts
+means_lmem_icv_flanker_incon_contrasts_confint <- confint(means_lmem_icv_flanker_incon_contrasts, parm, level = 0.95)
+means_lmem_icv_flanker_incon_contrasts_confint
+### Btw timepoint for each group (within-group)
+means_lmem_icv_flanker_incon_contrasts_within <- contrast(means_lmem_icv_flanker_incon_within, adj="none")
+means_lmem_icv_flanker_incon_contrasts_within
+means_lmem_icv_flanker_incon_contrasts_within_confint <- confint(means_lmem_icv_flanker_incon_contrasts_within, parm, level = 0.95)
+means_lmem_icv_flanker_incon_contrasts_within_confint
+
+check_model(lmem_icv_flanker_incon)
+
+# LMEM adjusting for baseline and 3-way interaction with sex
+lmem_icv_flanker_incon_sex <- lmer(icv_flanker_incon ~ factor(group)*factor(time)*factor(sex) + icv_flanker_incon.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_icv_flanker_incon_sex)
+summ(lmem_icv_flanker_incon_sex)
+tab_model(lmem_icv_flanker_incon_sex, p.val = "kr", show.df = TRUE, show.stat = TRUE)
+
+## Estimated Marginal Means
+### Btw group for each timepoint and group
+means_lmem_icv_flanker_incon_sex <- lsmeans(lmem_icv_flanker_incon_sex, ~group|sex|time)
+means_lmem_icv_flanker_incon_sex
+### Btw sex for each timepoint and group 
+means_lmem_icv_flanker_incon_btwsex <- lsmeans(lmem_icv_flanker_incon_sex, ~sex|time|group)
+means_lmem_icv_flanker_incon_btwsex
+
+## Contrasts and 95% CI
+### Btw group for each timepoint and group
+means_lmem_icv_flanker_incon_contrasts_sex <- contrast(means_lmem_icv_flanker_incon_sex, "trt.vs.ctrl", adj="none")
+means_lmem_icv_flanker_incon_contrasts_sex
+means_lmem_icv_flanker_incon_contrasts_confint_sex <- confint(means_lmem_icv_flanker_incon_contrasts_sex, parm, level = 0.95)
+means_lmem_icv_flanker_incon_contrasts_confint_sex
+### Btw sex for each timepoint and group 
+means_lmem_icv_flanker_incon_contrasts_btwsex <- contrast(means_lmem_icv_flanker_incon_btwsex, "trt.vs.ctrl", adj="none")
+means_lmem_icv_flanker_incon_contrasts_btwsex
+means_lmem_icv_flanker_incon_contrasts_confint_btwsex <- confint(means_lmem_icv_flanker_incon_contrasts_btwsex, parm, level = 0.95)
+means_lmem_icv_flanker_incon_contrasts_confint_btwsex
+
+```
+
+###### Tables
+```{r, results = 'asis'}
+
+tab_model(lmem_icv_flanker_incon, p.val = "kr", show.df = TRUE, show.stat = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+tab_model(lmem_icv_flanker_incon_sex, p.val = "kr", show.df = TRUE, show.se = TRUE, show.std = TRUE, show.stat = TRUE)
+
+```
+
+#### Flanker congruent
+```{r}
+
+# Look at ICC first
+lmem_icv_flanker_con_icc <- lmer(icv_flanker_con ~ (1 | id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_icv_flanker_con_icc) # ICC (intercept/intercept+residual) = 0.15
+
+# LMEM
+lmem_icv_flanker_con <- lmer(icv_flanker_con ~ factor(group)*factor(time) + icv_flanker_con.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_icv_flanker_con)
+summ(lmem_icv_flanker_con)
+
+check_model(lmem_icv_flanker_con)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_icv_flanker_con <- lsmeans(lmem_icv_flanker_con, ~group|time)
+means_lmem_icv_flanker_con
+### Btw timepoint for each group (within-group)
+#### Baseline
+all_data_nih_toolbox_long_lmm %>% 
+  dplyr::select("id", "group","icv_flanker_con.baseline") %>% 
+  slice(1:23) %>%
+  group_by(group) %>% 
+  summarise(mean = mean(icv_flanker_con.baseline),
+            sd = sd(icv_flanker_con.baseline)) %>%
+  ungroup()
+#### BR, HDBR completion, end of recovery
+means_lmem_icv_flanker_con_within <- lsmeans(lmem_icv_flanker_con, ~time|group)
+means_lmem_icv_flanker_con_within
+
+## Contrasts and 95% CI
+### Btw group for each timepoint
+means_lmem_icv_flanker_con_contrasts <- contrast(means_lmem_icv_flanker_con, "trt.vs.ctrl", adj="none")
+means_lmem_icv_flanker_con_contrasts
+means_lmem_icv_flanker_con_contrasts_confint <- confint(means_lmem_icv_flanker_con_contrasts, parm, level = 0.95)
+means_lmem_icv_flanker_con_contrasts_confint
+### Btw timepoint for each group (within-group)
+means_lmem_icv_flanker_con_contrasts_within <- contrast(means_lmem_icv_flanker_con_within, adj="none")
+means_lmem_icv_flanker_con_contrasts_within
+means_lmem_icv_flanker_con_contrasts_within_confint <- confint(means_lmem_icv_flanker_con_contrasts_within, parm, level = 0.95)
+means_lmem_icv_flanker_con_contrasts_within_confint
+
+# LMEM adjusting for baseline and 3-way interaction with sex
+lmem_icv_flanker_con_sex <- lmer(icv_flanker_con ~ factor(group)*factor(time)*factor(sex) + icv_flanker_con.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_icv_flanker_con_sex)
+summ(lmem_icv_flanker_con_sex)
+
+check_model(lmem_icv_flanker_con_sex)
+
+
+## Estimated Marginal Means
+### Btw group for each timepoint and group
+means_lmem_icv_flanker_con_sex <- lsmeans(lmem_icv_flanker_con_sex, ~group|sex|time)
+means_lmem_icv_flanker_con_sex
+### Btw sex for each timepoint and group 
+means_lmem_icv_flanker_con_btwsex <- lsmeans(lmem_icv_flanker_con_sex, ~sex|time|group)
+means_lmem_icv_flanker_con_btwsex
+
+## Contrasts and 95% CI
+### Btw group for each timepoint and group
+means_lmem_icv_flanker_con_contrasts_sex <- contrast(means_lmem_icv_flanker_con_sex, "trt.vs.ctrl", adj="none")
+means_lmem_icv_flanker_con_contrasts_sex
+means_lmem_icv_flanker_con_contrasts_confint_sex <- confint(means_lmem_icv_flanker_con_contrasts_sex, parm, level = 0.95)
+means_lmem_icv_flanker_con_contrasts_confint_sex
+### Btw sex for each timepoint and group
+means_lmem_icv_flanker_con_contrasts_btwsex <- contrast(means_lmem_icv_flanker_con_btwsex, "trt.vs.ctrl", adj="none")
+means_lmem_icv_flanker_con_contrasts_btwsex
+means_lmem_icv_flanker_con_contrasts_confint_btwsex <- confint(means_lmem_icv_flanker_con_contrasts_btwsex, parm, level = 0.95)
+means_lmem_icv_flanker_con_contrasts_confint_btwsex
+
+```
+Note: Assumptions looks fine. 
+Note: SIG at baseline. The initial lmm indicated SIG interaction at recovery_day7, but it wasn't confirmed by contrasts.
+
+###### Tables
+```{r, results = 'asis'}
+
+tab_model(lmem_icv_flanker_con, p.val = "kr", show.df = TRUE, show.stat = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+tab_model(lmem_icv_flanker_con_sex, p.val = "kr", show.df = TRUE, show.se = TRUE, show.std = TRUE, show.stat = TRUE)
+
+```
+
+#### DCCS mixed
+```{r}
+
+# Look at ICC first
+lmem_icv_dccs_mixed_icc <- lmer(icv_dccs_mixed ~ (1 | id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_icv_dccs_mixed_icc)
+icc(lmem_icv_dccs_mixed_icc) # ICC (intercept/intercept+residual) = 0.33
+
+# LMEM
+lmem_icv_dccs_mixed <- lmer(icv_dccs_mixed ~ factor(group)*factor(time) + icv_dccs_mixed.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_icv_dccs_mixed)
+summ(lmem_icv_dccs_mixed)
+
+check_model(lmem_icv_dccs_mixed)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_icv_dccs_mixed <- lsmeans(lmem_icv_dccs_mixed, ~group|time)
+means_lmem_icv_dccs_mixed
+### Btw timepoint for each group (within-group)
+#### Baseline
+all_data_nih_toolbox_long_lmm %>% 
+  dplyr::select("id", "group","icv_dccs_mixed.baseline") %>% 
+  slice(1:23) %>%
+  group_by(group) %>% 
+  summarise(mean = mean(icv_dccs_mixed.baseline),
+            sd = sd(icv_dccs_mixed.baseline)) %>%
+  ungroup()
+#### BR, HDBR completion, end of recovery
+means_lmem_icv_dccs_mixed_within <- lsmeans(lmem_icv_dccs_mixed, ~time|group)
+means_lmem_icv_dccs_mixed_within
+
+## Contrasts and 95% CI
+### Btw group for each timepoint
+means_lmem_icv_dccs_mixed_contrasts <- contrast(means_lmem_icv_dccs_mixed, "trt.vs.ctrl", adj="none")
+means_lmem_icv_dccs_mixed_contrasts
+means_lmem_icv_dccs_mixed_contrasts_confint <- confint(means_lmem_icv_dccs_mixed_contrasts, parm, level = 0.95)
+means_lmem_icv_dccs_mixed_contrasts_confint
+### Btw timepoint for each group (within-group)
+means_lmem_icv_dccs_mixed_contrasts_within <- contrast(means_lmem_icv_dccs_mixed_within, adj="none")
+means_lmem_icv_dccs_mixed_contrasts_within
+means_lmem_icv_dccs_mixed_contrasts_within_confint <- confint(means_lmem_icv_dccs_mixed_contrasts_within, parm, level = 0.95)
+means_lmem_icv_dccs_mixed_contrasts_within_confint
+
+# LMEM adjusting for baseline and 3-way interaction with sex
+lmem_icv_dccs_mixed_sex <- lmer(icv_dccs_mixed ~ factor(group)*factor(time)*factor(sex) + icv_dccs_mixed.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_icv_dccs_mixed_sex)
+summ(lmem_icv_dccs_mixed_sex)
+
+## Estimated Marginal Means
+### Btw group for each timepoint and group
+means_lmem_icv_dccs_mixed_sex <- lsmeans(lmem_icv_dccs_mixed_sex, ~group|sex|time)
+means_lmem_icv_dccs_mixed_sex
+### Btw sex for each timepoint and group 
+means_lmem_icv_dccs_mixed_btwsex <- lsmeans(lmem_icv_dccs_mixed_sex, ~sex|time|group)
+means_lmem_icv_dccs_mixed_btwsex
+
+## Contrasts and 95% CI
+### Btw group for each timepoint and group
+means_lmem_icv_dccs_mixed_contrasts_sex <- contrast(means_lmem_icv_dccs_mixed_sex, "trt.vs.ctrl", adj="none")
+means_lmem_icv_dccs_mixed_contrasts_sex
+means_lmem_icv_dccs_mixed_contrasts_confint_sex <- confint(means_lmem_icv_dccs_mixed_contrasts_sex, parm, level = 0.95)
+means_lmem_icv_dccs_mixed_contrasts_confint_sex
+
+```
+
+###### Tables
+```{r, results = 'asis'}
+
+tab_model(lmem_icv_dccs_mixed, p.val = "kr", show.df = TRUE, show.stat = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+tab_model(lmem_icv_dccs_mixed_sex, p.val = "kr", show.df = TRUE, show.se = TRUE, show.std = TRUE, show.stat = TRUE)
+
+```
+
+#### Processing speed
+```{r}
+
+# Look at ICC first
+lmem_icv_proc_speed_icc <- lmer(icv_proc_speed ~ (1 | id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_icv_proc_speed_icc) 
+icc(lmem_icv_proc_speed_icc) # ICC (intercept/intercept+residual) = 0.19. Typically, the minimum assumed value for the ICC is 0.05.
+
+# LMEM
+lmem_icv_proc_speed <- lmer(icv_proc_speed ~ factor(group)*factor(time) + icv_proc_speed.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_icv_proc_speed)
+summ(lmem_icv_proc_speed)
+
+check_model(lmem_icv_proc_speed)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_icv_proc_speed <- lsmeans(lmem_icv_proc_speed, ~group|time)
+means_lmem_icv_proc_speed
+### Btw timepoint for each group (within-group)
+#### Baseline
+all_data_nih_toolbox_long_lmm %>% 
+  dplyr::select("id", "group","icv_proc_speed.baseline") %>% 
+  slice(1:23) %>%
+  group_by(group) %>% 
+  summarise(mean = mean(icv_proc_speed.baseline),
+            sd = sd(icv_proc_speed.baseline)) %>%
+  ungroup()
+#### BR, HDBR completion, end of recovery
+means_lmem_icv_proc_speed_within <- lsmeans(lmem_icv_proc_speed, ~time|group)
+means_lmem_icv_proc_speed_within
+
+## Contrasts and 95% CI
+### Btw group for each timepoint
+means_lmem_icv_proc_speed_contrasts <- contrast(means_lmem_icv_proc_speed, "trt.vs.ctrl", adj="none")
+means_lmem_icv_proc_speed_contrasts
+means_lmem_icv_proc_speed_contrasts_confint <- confint(means_lmem_icv_proc_speed_contrasts, parm, level = 0.95)
+means_lmem_icv_proc_speed_contrasts_confint
+### Btw timepoint for each group (within-group)
+means_lmem_icv_proc_speed_contrasts_within <- contrast(means_lmem_icv_proc_speed_within, adj="none")
+means_lmem_icv_proc_speed_contrasts_within
+means_lmem_icv_proc_speed_contrasts_within_confint <- confint(means_lmem_icv_proc_speed_contrasts_within, parm, level = 0.95)
+means_lmem_icv_proc_speed_contrasts_within_confint
+
+# LMEM adjusting for baseline and 3-way interaction with sex
+lmem_icv_proc_speed_sex <- lmer(icv_proc_speed ~ factor(group)*factor(time)*factor(sex) + icv_proc_speed.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_icv_proc_speed_sex)
+summ(lmem_icv_proc_speed_sex)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_icv_proc_speed_sex <- lsmeans(lmem_icv_proc_speed_sex, ~group|sex|time)
+means_lmem_icv_proc_speed_sex
+
+## Contrasts and 95% CI
+### Btw group for each timepoint
+means_lmem_icv_proc_speed_contrasts_sex <- contrast(means_lmem_icv_proc_speed_sex, "trt.vs.ctrl", adj="none")
+means_lmem_icv_proc_speed_contrasts_sex
+means_lmem_icv_proc_speed_contrasts_confint_sex <- confint(means_lmem_icv_proc_speed_contrasts_sex, parm, level = 0.95)
+means_lmem_icv_proc_speed_contrasts_confint_sex
+
+```
+
+###### Tables
+```{r, results = 'asis'}
+
+tab_model(lmem_icv_proc_speed, p.val = "kr", show.df = TRUE, show.stat = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+tab_model(lmem_icv_proc_speed_sex, p.val = "kr", show.df = TRUE, show.se = TRUE, show.std = TRUE, show.stat = TRUE)
+
+```
+
+\newpage
+### Residual ISD
+#### Flanker incongruent
+```{r}
+
+# Look at ICC first
+lmem_res_isd_flanker_incon_icc <- lmer(res_isd_flanker_incon ~ (1 | id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_res_isd_flanker_incon_icc) 
+icc(lmem_res_isd_flanker_incon_icc) # ICC (intercept/intercept+residual) = 0.11. Typically, the minimum assumed value for the ICC is 0.05.
+
+# LMEM adjusted for baseline
+lmem_res_isd_flanker_incon <- lmer(res_isd_flanker_incon ~ factor(group)*factor(time) + res_isd_flanker_incon.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_res_isd_flanker_incon)
+summ(lmem_res_isd_flanker_incon)
+tab_model(lmem_res_isd_flanker_incon, p.val = "kr", show.df = TRUE, show.stat = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+check_model(lmem_res_isd_flanker_incon)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_flanker_incon <- lsmeans(lmem_res_isd_flanker_incon, ~group|time)
+means_lmem_res_isd_flanker_incon
+### Btw timepoint for each group (within-group)
+#### Baseline
+all_data_nih_toolbox_long_lmm %>% 
+  dplyr::select("id", "group","res_isd_flanker_incon.baseline") %>% 
+  slice(1:23) %>%
+  group_by(group) %>% 
+  summarise(mean = mean(res_isd_flanker_incon.baseline),
+            sd = sd(res_isd_flanker_incon.baseline)) %>%
+  ungroup()
+#### BR, HDBR completion, end of recovery
+means_lmem_res_isd_flanker_incon_within <- lsmeans(lmem_res_isd_flanker_incon, ~time|group)
+means_lmem_res_isd_flanker_incon_within
+
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_flanker_incon_contrasts <- contrast(means_lmem_res_isd_flanker_incon, "trt.vs.ctrl", adj="none")
+means_lmem_res_isd_flanker_incon_contrasts
+means_lmem_res_isd_flanker_incon_contrasts_confint <- confint(means_lmem_res_isd_flanker_incon_contrasts, parm, level = 0.95)
+means_lmem_res_isd_flanker_incon_contrasts_confint
+### Btw timepoint for each group (within-group)
+means_lmem_res_isd_flanker_incon_contrasts_within <- contrast(means_lmem_res_isd_flanker_incon_within, adj="none")
+means_lmem_res_isd_flanker_incon_contrasts_within
+means_lmem_res_isd_flanker_incon_contrasts_within_confint <- confint(means_lmem_res_isd_flanker_incon_contrasts_within, psrm, level = 0.95)
+means_lmem_res_isd_flanker_incon_contrasts_within_confint
+
+# LMEM adjusted for baseline and sex 3-way interaction
+lmem_res_isd_flanker_incon_sex <- lmer(res_isd_flanker_incon ~ factor(group)*factor(time)*factor(sex) + res_isd_flanker_incon.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_res_isd_flanker_incon_sex)
+tab_model(lmem_res_isd_flanker_incon_sex, p.val = "kr", show.df = TRUE, show.stat = TRUE)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_flanker_incon_sex <- lsmeans(lmem_res_isd_flanker_incon_sex, ~group|sex|time)
+means_lmem_res_isd_flanker_incon_sex
+
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_flanker_incon_contrasts_sex <- contrast(means_lmem_res_isd_flanker_incon_sex, "trt.vs.ctrl", adj="none")
+means_lmem_res_isd_flanker_incon_contrasts_sex
+means_lmem_res_isd_flanker_incon_contrasts_confint_sex <- confint(means_lmem_res_isd_flanker_incon_contrasts_sex, parm, level = 0.95)
+means_lmem_res_isd_flanker_incon_contrasts_confint_sex
+
+check_model(lmem_res_isd_flanker_incon_sex)
+
+```
+
+###### Tables
+```{r, results = 'asis'}
+
+tab_model(lmem_res_isd_flanker_incon, p.val = "kr", show.df = TRUE, show.stat = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+tab_model(lmem_res_isd_flanker_incon_sex, p.val = "kr", show.df = TRUE, show.se = TRUE, show.std = TRUE, show.stat = TRUE)
+
+```
+
+\newpage
+#### Flanker congruent
+```{r}
+
+# Look at ICC first
+lmem_res_isd_flanker_con_icc <- lmer(res_isd_flanker_con ~ (1 | id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_res_isd_flanker_con_icc) 
+icc(lmem_res_isd_flanker_con_icc) # ICC (intercept/intercept+residual) = 0.27. Typically, the minimum assumed value for the ICC is 0.05.
+
+# LMEM
+lmem_res_isd_flanker_con <- lmer(res_isd_flanker_con ~ factor(group)*factor(time) + res_isd_flanker_con.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_res_isd_flanker_con)
+summ(lmem_res_isd_flanker_con)
+
+check_model(lmem_res_isd_flanker_con)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_flanker_con <- lsmeans(lmem_res_isd_flanker_con, ~group|time)
+means_lmem_res_isd_flanker_con
+### Btw timepoint for each group (within-group)
+#### Baseline
+all_data_nih_toolbox_long_lmm %>% 
+  dplyr::select("id", "group","res_isd_flanker_con.baseline") %>% 
+  slice(1:23) %>%
+  group_by(group) %>% 
+  summarise(mean = mean(res_isd_flanker_con.baseline),
+            sd = sd(res_isd_flanker_con.baseline)) %>%
+  ungroup()
+#### BR, HDBR completion, end of recovery
+means_lmem_res_isd_flanker_con_within <- lsmeans(lmem_res_isd_flanker_con, ~time|group)
+means_lmem_res_isd_flanker_con_within
+
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_flanker_con_contrasts <- contrast(means_lmem_res_isd_flanker_con, "trt.vs.ctrl", adj="none")
+means_lmem_res_isd_flanker_con_contrasts
+means_lmem_res_isd_flanker_con_contrasts_confint <- confint(means_lmem_res_isd_flanker_con_contrasts, parm, level = 0.95)
+means_lmem_res_isd_flanker_con_contrasts_confint
+### Btw timepoint for each group (within-group)
+means_lmem_res_isd_flanker_con_contrasts_within <- contrast(means_lmem_res_isd_flanker_con_within, adj="none")
+means_lmem_res_isd_flanker_con_contrasts_within
+means_lmem_res_isd_flanker_con_contrasts_within_confint <- confint(means_lmem_res_isd_flanker_con_contrasts_within, parm, level = 0.95)
+means_lmem_res_isd_flanker_con_contrasts_within_confint
+
+# LMEM adjusted for baseline and sex 3-way interaction
+lmem_res_isd_flanker_con_sex <- lmer(res_isd_flanker_con ~ factor(group)*factor(time)*factor(sex) + res_isd_flanker_con.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_res_isd_flanker_con_sex)
+summ(lmem_res_isd_flanker_con_sex)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_flanker_con_sex <- lsmeans(lmem_res_isd_flanker_con_sex, ~group|sex|time)
+means_lmem_res_isd_flanker_con_sex
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_flanker_con_contrasts_sex <- contrast(means_lmem_res_isd_flanker_con_sex, "trt.vs.ctrl", adj="none")
+means_lmem_res_isd_flanker_con_contrasts_sex
+means_lmem_res_isd_flanker_con_contrasts_confint_sex <- confint(means_lmem_res_isd_flanker_con_contrasts_sex, parm, level = 0.95)
+means_lmem_res_isd_flanker_con_contrasts_confint_sex
+
+```
+
+###### Tables
+```{r, results = 'asis'}
+
+tab_model(lmem_res_isd_flanker_con, p.val = "kr", show.df = TRUE, show.stat = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+tab_model(lmem_res_isd_flanker_con_sex, p.val = "kr", show.df = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+```
+
+\newpage
+#### DCCS mixed
+```{r}
+
+# Look at ICC first
+lmem_res_isd_dccs_mixed_icc <- lmer(res_isd_dccs_mixed ~ (1 | id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_res_isd_dccs_mixed_icc) 
+icc(lmem_res_isd_dccs_mixed_icc) # ICC (intercept/intercept+residual) = 0.69
+
+# LMEM
+lmem_res_isd_dccs_mixed <- lmer(res_isd_dccs_mixed ~ factor(group)*factor(time) + res_isd_dccs_mixed.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_res_isd_dccs_mixed)
+summ(lmem_res_isd_dccs_mixed)
+
+check_model(lmem_res_isd_dccs_mixed)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_dccs_mixed <- lsmeans(lmem_res_isd_dccs_mixed, ~group|time)
+means_lmem_res_isd_dccs_mixed
+### Btw timepoint for each group (within-group)
+#### Baseline
+all_data_nih_toolbox_long_lmm %>% 
+  dplyr::select("id", "group","res_isd_dccs_mixed.baseline") %>% 
+  slice(1:23) %>%
+  group_by(group) %>% 
+  summarise(mean = mean(res_isd_dccs_mixed.baseline),
+            sd = sd(res_isd_dccs_mixed.baseline)) %>%
+  ungroup()
+#### BR, HDBR completion, end of recovery
+means_lmem_res_isd_dccs_mixed_within <- lsmeans(lmem_res_isd_dccs_mixed, ~time|group)
+means_lmem_res_isd_dccs_mixed_within
+
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_dccs_mixed_contrasts <- contrast(means_lmem_res_isd_dccs_mixed, "trt.vs.ctrl", adj="none")
+means_lmem_res_isd_dccs_mixed_contrasts
+means_lmem_res_isd_dccs_mixed_contrasts_confint <- confint(means_lmem_res_isd_dccs_mixed_contrasts, parm, level = 0.95)
+means_lmem_res_isd_dccs_mixed_contrasts_confint
+### Btw timepoint for each group (within-group)
+means_lmem_res_isd_dccs_mixed_contrasts_within <- contrast(means_lmem_res_isd_dccs_mixed_within, adj="none")
+means_lmem_res_isd_dccs_mixed_contrasts_within
+means_lmem_res_isd_dccs_mixed_contrasts_within_confint <- confint(means_lmem_res_isd_dccs_mixed_contrasts_within, parm, level = 0.95)
+means_lmem_res_isd_dccs_mixed_contrasts_within_confint
+
+# LMEM adjusted for baseline and sex 3-way interaction
+lmem_res_isd_dccs_mixed_sex <- lmer(res_isd_dccs_mixed ~ factor(group)*factor(time)*factor(sex) + res_isd_dccs_mixed.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_res_isd_dccs_mixed_sex)
+summ(lmem_res_isd_dccs_mixed_sex)
+
+check_model(lmem_res_isd_dccs_mixed_sex)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_dccs_mixed_sex <- lsmeans(lmem_res_isd_dccs_mixed_sex, ~group|sex|time)
+means_lmem_res_isd_dccs_mixed_sex
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_dccs_mixed_contrasts_sex <- contrast(means_lmem_res_isd_dccs_mixed_sex, "trt.vs.ctrl", adj="none")
+means_lmem_res_isd_dccs_mixed_contrasts_sex
+means_lmem_res_isd_dccs_mixed_contrasts_confint_sex <- confint(means_lmem_res_isd_dccs_mixed_contrasts_sex, parm, level = 0.95)
+means_lmem_res_isd_dccs_mixed_contrasts_confint_sex
+
+```
+
+###### Tables
+```{r, results = 'asis'}
+
+tab_model(lmem_res_isd_dccs_mixed, p.val = "kr", show.df = TRUE, show.stat = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+tab_model(lmem_res_isd_dccs_mixed_sex, p.val = "kr", show.df = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+```
+
+\newpage
+#### Processing speed (PACPS)
+```{r}
+
+# Look at ICC first
+lmem_res_isd_proc_speed_icc <- lmer(res_isd_proc_speed ~ (1 | id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_res_isd_proc_speed_icc) # ICC (intercept/intercept+residual) = 0.45
+
+# LMEM
+lmem_res_isd_proc_speed <- lmer(res_isd_proc_speed ~ factor(group)*factor(time) + res_isd_proc_speed.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_res_isd_proc_speed)
+summ(lmem_res_isd_proc_speed)
+check_model(lmem_res_isd_proc_speed)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_proc_speed <- lsmeans(lmem_res_isd_proc_speed, ~group|time)
+means_lmem_res_isd_proc_speed
+### Btw timepoint for each group (within-group)
+#### Baseline
+all_data_nih_toolbox_long_lmm %>% 
+  dplyr::select("id", "group","res_isd_proc_speed.baseline") %>% 
+  slice(1:23) %>%
+  group_by(group) %>% 
+  summarise(mean = mean(res_isd_proc_speed.baseline),
+            sd = sd(res_isd_proc_speed.baseline)) %>%
+  ungroup()
+#### BR, HDBR completion, end of recovery
+means_lmem_res_isd_proc_speed_within <- lsmeans(lmem_res_isd_proc_speed, ~time|group)
+means_lmem_res_isd_proc_speed_within
+
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_proc_speed_contrasts <- contrast(means_lmem_res_isd_proc_speed, "trt.vs.ctrl", adj="none")
+means_lmem_res_isd_proc_speed_contrasts
+means_lmem_res_isd_proc_speed_contrasts_confint <- confint(means_lmem_res_isd_proc_speed_contrasts, parm, level = 0.95)
+means_lmem_res_isd_proc_speed_contrasts_confint
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_proc_speed_contrasts_within <- contrast(means_lmem_res_isd_proc_speed_within, adj="none")
+means_lmem_res_isd_proc_speed_contrasts_within
+means_lmem_res_isd_proc_speed_contrasts_within_confint <- confint(means_lmem_res_isd_proc_speed_contrasts_within, parm, level = 0.95)
+means_lmem_res_isd_proc_speed_contrasts_within_confint
+
+# LMEM adjusted for baseline and sex 3-way interaction
+lmem_res_isd_proc_speed_sex <- lmer(res_isd_proc_speed ~ factor(group)*factor(time)*factor(sex) + res_isd_proc_speed.baseline + (1|id), data = all_data_nih_toolbox_long_lmm)
+summary(lmem_res_isd_proc_speed_sex)
+summ(lmem_res_isd_proc_speed_sex)
+check_model(lmem_res_isd_proc_speed_sex)
+
+## Estimated Marginal Means
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_proc_speed_sex <- lsmeans(lmem_res_isd_proc_speed_sex, ~group|sex|time)
+means_lmem_res_isd_proc_speed_sex
+
+## Contrasts and 95% CI
+### Btw group for each timepoint (btw-group)
+means_lmem_res_isd_proc_speed_contrasts_sex <- contrast(means_lmem_res_isd_proc_speed_sex, "trt.vs.ctrl", adj="none")
+means_lmem_res_isd_proc_speed_contrasts_sex
+means_lmem_res_isd_proc_speed_contrasts_confint_sex <- confint(means_lmem_res_isd_proc_speed_contrasts_sex, parm, level = 0.95)
+means_lmem_res_isd_proc_speed_contrasts_confint_sex
+
+```
+
+###### Tables
+```{r, results = 'asis'}
+
+tab_model(lmem_res_isd_proc_speed, p.val = "kr", show.df = TRUE, show.stat = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+tab_model(lmem_res_isd_proc_speed_sex, p.val = "kr", show.df = TRUE) # Use of tab_model: https://cran.r-project.org/web/packages/sjPlot/vignettes/tab_mixed.html
+
+```
+
+### Descriptive at baseline
+```{r, message=FALSE}
+
+baseline <- all_data_nih_toolbox_long_lmm %>% 
+  slice(1:23)
+  
+kable(digits = 4, print(printToggle = FALSE, CreateTableOne(data = baseline, 
+                                                c("mean_rt_flanker_con.baseline",
+                                                  "mean_rt_flanker_incon.baseline",
+                                                  "mean_rt_flanker_inter.baseline",
+                                                  "mean_rt_dccs_mixed.baseline",
+                                                  "mean_rt_proc_speed.baseline",
+                                                  "raw_isd_flanker_con.baseline",
+                                                  "raw_isd_flanker_incon.baseline",
+                                                  "raw_isd_flanker_inter.baseline",
+                                                  "raw_isd_dccs_mixed.baseline",  
+                                                  "raw_isd_proc_speed.baseline",
+                                                  "icv_flanker_con.baseline",
+                                                  "icv_flanker_incon.baseline",
+                                                  "icv_flanker_inter.baseline",
+                                                  "icv_dccs_mixed.baseline",
+                                                  "icv_proc_speed.baseline",
+                                                  "res_isd_flanker_con.baseline",
+                                                  "res_isd_flanker_incon.baseline",
+                                                  "res_isd_flanker_inter.baseline",
+                                                  "res_isd_dccs_mixed.baseline",    
+                                                  "res_isd_proc_speed.baseline"),  
+                                                  includeNA = TRUE, strata = "group", addOverall = TRUE)))
+
+```
+
+# Baseline charecteristics
+## Loading the data
+
+```{r, message = FALSE}
+
+csa_demo <- read_csv("../my_spreadsheets/csa_demographics_20230117.csv", 
+                         show_col_types = FALSE,
+                         name_repair = make_clean_names) %>% 
+  mutate(id = tolower(id)) %>% 
+  glimpse()
+
+```
+
+## Data cleaning 
+```{r, message = FALSE}
+
+csa_demo <- csa_demo %>%
+  rename_with(~(gsub(".", "_", .x, fixed = TRUE))) %>%
+  mutate(across(where(is.character), tolower)) %>% 
+  rename_at(c(10:15), .funs = tolower) %>% 
+  glimpse()
+
+```
+
+## Data management
+### Checking data — Included subjects only
+### Demographics 
+```{r, }
+# Checking variables
+## Continuous demographics data
+
+# Alternative for running descriptives
+csa_demo %>% 
+  group_by(group) %>% 
+  summarise(across(where(is.numeric),
+                   list(mean = ~ mean(.x, na.rm = TRUE),
+                        sd = ~ sd(.x, na.rm = TRUE),
+                        n = ~ n()),
+                   .names = "{.col}.{.fn}")) %>% # Will add mean, sd, and n to the end of col names
+  # Print the table
+  pivot_longer(cols = ends_with(c("mean", "sd", "n")),
+               names_to = c("variable", ".value"),
+               names_sep = "\\.") %>% 
+  ungroup()
+
+
+kable(digits = 4, print(printToggle = FALSE, CreateTableOne(data = csa_demo, 
+                                                c("age",
+                                                  "height_cm",
+                                                  "weight_kg",
+                                                  "bmi",
+                                                  "education",
+                                                  "sex",
+                                                  "vo2_peak_ml_min_kg",
+                                                  "pct_fat_total", 
+                                                  "pase"), strata = "group", 
+                                                  includeNA = TRUE, addOverall = TRUE)))
+
+kable(digits = 4, print(printToggle = FALSE, CreateTableOne(data = csa_demo, 
+                                                c("pct_fat_total",
+                                                  "vo2_peak_ml_min_kg"), strata = c("sex"), 
+                                                  includeNA = TRUE, addOverall = TRUE)))
+
+## Histograms
+hist(csa_demo$age)
+hist(csa_demo$height_cm)
+hist(csa_demo$weight_kg)
+hist(csa_demo$bmi)
+hist(csa_demo$education)
+hist(csa_demo$vo2_peak_ml_min_kg)
+hist(csa_demo$pct_fat_total)
+hist(csa_demo$catecholamines)
+    
+## Normality tests
+kable(digits = 2, caption = "Normality test", csa_demo %>% 
+        shapiro_test(age,
+                     height_cm,
+                     weight_kg,
+                     bmi,
+                     education))
+
+
+```
